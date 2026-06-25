@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "volt",
+    "volt_tracker",
+]
+resolver = "2"
