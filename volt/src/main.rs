@@ -1,3 +1,5 @@
+mod daemon;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use sha2::{Digest, Sha256};
@@ -23,6 +25,7 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
+    Daemon,
     Benchmark {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
@@ -31,31 +34,35 @@ enum Commands {
 
 struct Volt {
     root: PathBuf,
+    tracker_lib: PathBuf,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-struct CacheEntry {
-    path: String,
-    object_hash: String,
-    size: u64,
-    mtime: i64,
-    mtime_nsec: i64,
+pub struct CacheEntry {
+    pub path: String,
+    pub object_hash: String,
+    pub size: u64,
+    pub mtime: i64,
+    pub mtime_nsec: i64,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
-struct CacheManifest {
-    input_files: Vec<String>,
-    entries: Vec<CacheEntry>,
-    command: Vec<String>,
-    env_fingerprint: String,
-    hash: String,
+pub struct CacheManifest {
+    pub input_files: Vec<String>,
+    pub entries: Vec<CacheEntry>,
+    pub command: Vec<String>,
+    pub env_fingerprint: String,
+    pub hash: String,
 }
 
 fn is_transient_output(path: &str) -> bool {
     if path.contains("/tmp/cc") || path.contains("/tmp/rustc") {
         return true;
     }
-    if path.contains(".cargo-lock") || path.contains(".cargo-build-lock") || path.contains(".cargo-artifact-lock") {
+    if path.contains(".cargo-lock")
+        || path.contains(".cargo-build-lock")
+        || path.contains(".cargo-artifact-lock")
+    {
         return true;
     }
     if path.contains("CACHEDIR.TAG") {
@@ -72,7 +79,12 @@ impl Volt {
                 let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
                 Path::new(&home).join(".volt_cache")
             });
-        Ok(Self { root })
+
+        let mut tracker_lib = env::current_exe()?;
+        tracker_lib.pop();
+        tracker_lib.push("libvolt_tracker.so");
+
+        Ok(Self { root, tracker_lib })
     }
 
     fn ensure_dirs(&self) -> Result<()> {
@@ -83,7 +95,9 @@ impl Volt {
 
     fn env_fingerprint(cmd: &[String]) -> String {
         let mut hasher = Sha256::new();
-        let env_keys = ["CC", "CXX", "CFLAGS", "CXXFLAGS", "LDFLAGS", "RUSTFLAGS", "PROFILE", "OPT_LEVEL"];
+        let env_keys = [
+            "CC", "CXX", "CFLAGS", "CXXFLAGS", "LDFLAGS", "RUSTFLAGS", "PROFILE", "OPT_LEVEL",
+        ];
         for key in &env_keys {
             if let Ok(val) = env::var(key) {
                 hasher.update(key.as_bytes());
@@ -167,165 +181,47 @@ impl Volt {
             || path.contains("/sys/")
     }
 
-    fn trace_build(cmd: &[String]) -> Result<(HashSet<String>, HashSet<String>)> {
-        let mut inputs = HashSet::new();
-        let mut outputs = HashSet::new();
-
+    fn traced_run(&self, cmd: &[String]) -> Result<(HashSet<String>, HashSet<String>)> {
         let trace_file = tempfile::NamedTempFile::new()?;
         let trace_path = trace_file.path().to_path_buf();
 
-        let status = Command::new("strace")
-            .arg("-f")
-            .arg("-e")
-            .arg("trace=open,openat,creat")
-            .arg("-o")
-            .arg(&trace_path)
-            .args(cmd)
+        let status = Command::new(&cmd[0])
+            .args(&cmd[1..])
+            .env("LD_PRELOAD", &self.tracker_lib)
+            .env("VOLT_TRACE_FILE", &trace_path)
             .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .status()
-            .context("Failed to run strace")?;
+            .context("Failed to run command with LD_PRELOAD tracker")?;
 
         if !status.success() {
-            anyhow::bail!("Build command failed under strace");
+            anyhow::bail!("Build command failed");
         }
 
         let trace_content = fs::read_to_string(&trace_path)?;
+        let mut inputs = HashSet::new();
+        let mut outputs = HashSet::new();
+
         for line in trace_content.lines() {
             let trimmed = line.trim();
-            if trimmed.contains("ENOENT") || trimmed.contains("= -1") || trimmed.contains("= E") {
+            if trimmed.is_empty() {
                 continue;
             }
 
-            if let Some(idx) = trimmed.find("linkat(") {
-                if let Some(path) = Self::extract_linkat_dst(&trimmed[idx..]) {
-                    outputs.insert(path);
-                }
-                continue;
-            }
-            if let Some(idx) = trimmed.find("renameat(") {
-                if let Some(path) = Self::extract_renameat_dst(&trimmed[idx..]) {
-                    outputs.insert(path);
-                }
-                continue;
-            }
-            if let Some(idx) = trimmed.find("renameat2(") {
-                if let Some(path) = Self::extract_renameat_dst(&trimmed[idx..]) {
-                    outputs.insert(path);
-                }
-                continue;
-            }
-            if let Some(idx) = trimmed.find("rename(") {
-                if let Some(path) = Self::extract_rename_dst(&trimmed[idx..]) {
-                    outputs.insert(path);
-                }
-                continue;
-            }
-            if let Some(idx) = trimmed.find("link(") {
-                if let Some(path) = Self::extract_rename_dst(&trimmed[idx..]) {
-                    outputs.insert(path);
-                }
-                continue;
-            }
-
-            let syscall_line = if let Some(idx) = trimmed.find("openat64(") {
-                &trimmed[idx..]
-            } else if let Some(idx) = trimmed.find("openat(") {
-                &trimmed[idx..]
-            } else if let Some(idx) = trimmed.find("open64(") {
-                &trimmed[idx..]
-            } else if let Some(idx) = trimmed.find("open(") {
-                &trimmed[idx..]
-            } else if let Some(idx) = trimmed.find("creat(") {
-                &trimmed[idx..]
-            } else {
-                continue;
-            };
-
-            if let Some(p) = Self::extract_path(syscall_line) {
-                let is_write = syscall_line.contains("O_WRONLY")
-                    || syscall_line.contains("O_RDWR")
-                    || syscall_line.contains("O_CREAT");
-                if is_write {
+            if let Some(rest) = trimmed.strip_prefix("W:") {
+                let p = rest.to_string();
+                if !is_transient_output(&p) && !Self::is_ephemeral_input(&p) {
                     outputs.insert(p);
-                } else if !Self::is_ephemeral_input(&p) {
+                }
+            } else if let Some(rest) = trimmed.strip_prefix("R:") {
+                let p = rest.to_string();
+                if !Self::is_ephemeral_input(&p) {
                     inputs.insert(p);
                 }
             }
         }
 
         Ok((inputs, outputs))
-    }
-
-    fn extract_linkat_dst(arg: &str) -> Option<String> {
-        let rest = arg.trim_start();
-        let parts: Vec<&str> = rest.split(',').collect();
-        if parts.len() >= 4 {
-            let path_candidate = parts[3].trim();
-            if let Some(start) = path_candidate.find('"') {
-                if let Some(end) = path_candidate[start + 1..].find('"') {
-                    let raw = &path_candidate[start + 1..start + 1 + end];
-                    if raw.starts_with('/') {
-                        return Some(raw.to_string());
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    fn extract_renameat_dst(arg: &str) -> Option<String> {
-        let rest = arg.trim_start();
-        let parts: Vec<&str> = rest.split(',').collect();
-        if parts.len() >= 4 {
-            let path_candidate = parts[3].trim();
-            if let Some(start) = path_candidate.find('"') {
-                if let Some(end) = path_candidate[start + 1..].find('"') {
-                    let raw = &path_candidate[start + 1..start + 1 + end];
-                    if raw.starts_with('/') {
-                        return Some(raw.to_string());
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    fn extract_rename_dst(arg: &str) -> Option<String> {
-        let rest = arg.trim_start();
-        let parts: Vec<&str> = rest.split(',').collect();
-        if parts.len() >= 2 {
-            let path_candidate = parts[1].trim();
-            if let Some(start) = path_candidate.find('"') {
-                if let Some(end) = path_candidate[start + 1..].find('"') {
-                    let raw = &path_candidate[start + 1..start + 1 + end];
-                    if raw.starts_with('/') {
-                        return Some(raw.to_string());
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    fn extract_path(arg: &str) -> Option<String> {
-        let rest = arg.trim_start();
-        if let Some(start) = rest.find('"') {
-            if let Some(end) = rest[start + 1..].find('"') {
-                let raw = &rest[start + 1..start + 1 + end];
-                let unescaped = raw.replace("\\\"", "\"");
-                if unescaped.starts_with("/dev/")
-                    || unescaped.starts_with("/proc/")
-                    || unescaped.starts_with("/sys/")
-                    || unescaped.starts_with("pipe:")
-                    || unescaped.starts_with("socket:")
-                    || !unescaped.starts_with('/')
-                {
-                    return None;
-                }
-                return Some(unescaped);
-            }
-        }
-        None
     }
 
     fn reflink_or_copy(src: &Path, dst: &Path) -> Result<()> {
@@ -462,19 +358,30 @@ impl Volt {
 
         let env_fp = Self::env_fingerprint(&cmd);
 
-        match self.find_cached_manifest(&cmd, &env_fp)? {
-            Some(existing) => {
-                println!("Volt: Cache HIT ({} outputs) - restoring directly", existing.entries.len());
-                let t0 = Instant::now();
-                let restored = self.restore_manifest(&existing)?;
-                println!("Volt: Restored {} artifacts in {:?}", restored, t0.elapsed());
-                return Ok(());
-            }
-            None => {}
+        if let Some(existing) = self.find_cached_manifest(&cmd, &env_fp)? {
+            println!(
+                "Volt: Cache HIT ({} outputs) - restoring directly",
+                existing.entries.len()
+            );
+            let t0 = Instant::now();
+            let restored = self.restore_manifest(&existing)?;
+            println!("Volt: Restored {} artifacts in {:?}", restored, t0.elapsed());
+            return Ok(());
         }
 
-        println!("Volt: Tracing build...");
-        let (inputs, outputs) = Self::trace_build(&cmd)?;
+        println!("Volt: Cache MISS - tracing build with LD_PRELOAD...");
+        let (inputs, outputs) = match self.traced_run(&cmd) {
+            Ok(result) => result,
+            Err(e) => {
+                eprintln!("Volt: LD_PRELOAD tracker failed: {}", e);
+                eprintln!("Volt: Falling back to direct execution (no caching)");
+                let status = Command::new(&cmd[0]).args(&cmd[1..]).status()?;
+                if !status.success() {
+                    anyhow::bail!("Build command failed");
+                }
+                return Ok(());
+            }
+        };
 
         if inputs.is_empty() && outputs.is_empty() {
             println!("Volt: No files tracked, running directly");
@@ -495,16 +402,26 @@ impl Volt {
             return Ok(());
         }
 
-        println!(
-            "Volt: Storing {} outputs",
-            outputs.len()
-        );
+        if let Ok(Some(peer_addr)) = daemon::query_peer_cache(&self.root, &hash) {
+            println!("Volt: P2P Cache HIT from peer {}", peer_addr);
+            if let Some(manifest) = self.lookup_cache(&hash)? {
+                let restored = self.restore_manifest(&manifest)?;
+                println!("Volt: Restored {} artifacts from peer", restored);
+                return Ok(());
+            }
+        }
+
+        println!("Volt: Storing {} outputs", outputs.len());
         self.store_outputs(&hash, &outputs, &inputs, &cmd)?;
 
         Ok(())
     }
 
-    fn find_cached_manifest(&self, cmd: &[String], env_fp: &str) -> Result<Option<CacheManifest>> {
+    fn find_cached_manifest(
+        &self,
+        cmd: &[String],
+        env_fp: &str,
+    ) -> Result<Option<CacheManifest>> {
         let manifests_dir = self.root.join("manifests");
         if !manifests_dir.exists() {
             return Ok(None);
@@ -564,9 +481,9 @@ impl Volt {
 
         println!("=== Volt Benchmark ===\n");
 
-        println!("--- Step 1: Cold build (traced) ---");
+        println!("--- Step 1: Cold build (traced with LD_PRELOAD) ---");
         let t0 = Instant::now();
-        let (inputs, outputs) = Self::trace_build(&cmd)?;
+        let (inputs, outputs) = self.traced_run(&cmd)?;
         let cold_time = t0.elapsed();
 
         if inputs.is_empty() {
@@ -574,14 +491,23 @@ impl Volt {
         }
 
         let hash = self.compute_input_hash(&cmd, &inputs)?;
-        println!("Captured {} inputs, {} outputs", inputs.len(), outputs.len());
+        println!(
+            "Captured {} inputs, {} outputs",
+            inputs.len(),
+            outputs.len()
+        );
         println!("Cold build: {:?}\n", cold_time);
 
         println!("--- Step 2: Storing in Volt cache ---");
         self.store_outputs(&hash, &outputs, &inputs, &cmd)?;
-        let manifest = self.lookup_cache(&hash)?
+        let manifest = self
+            .lookup_cache(&hash)?
             .expect("Manifest should exist after store");
-        println!("Stored {} artifacts, hash={}\n", manifest.entries.len(), &hash[..16]);
+        println!(
+            "Stored {} artifacts, hash={}\n",
+            manifest.entries.len(),
+            &hash[..16]
+        );
 
         println!("--- Step 3: Cleaning build artifacts ---");
         self.clean_build_artifacts(&cmd)?;
@@ -651,6 +577,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Init => volt.ensure_dirs()?,
         Commands::Run { cmd } => volt.run(cmd)?,
+        Commands::Daemon => daemon::run_daemon(volt.root)?,
         Commands::Benchmark { cmd } => volt.benchmark(cmd)?,
     }
 
