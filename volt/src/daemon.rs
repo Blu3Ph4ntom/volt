@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -12,6 +13,9 @@ const MULTICAST_ADDR: &str = "239.255.255.250";
 const MULTICAST_PORT: u16 = 13371;
 const KEEPALIVE_INTERVAL: u64 = 30;
 const PEER_TIMEOUT: u64 = 90;
+const TCP_TIMEOUT_MS: u64 = 500;
+const TCP_LONG_TIMEOUT_MS: u64 = 5000;
+const P2P_QUERY_TIMEOUT_MS: u64 = 100;
 
 #[derive(Debug, Clone)]
 struct PeerInfo {
@@ -110,6 +114,9 @@ fn run_tcp_server(state: Arc<DaemonState>) -> Result<()> {
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));
             }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                continue;
+            }
             Err(e) => {
                 eprintln!("Accept error: {}", e);
                 std::thread::sleep(Duration::from_millis(100));
@@ -123,8 +130,8 @@ fn handle_tcp_client(
     _addr: std::net::SocketAddr,
     state: Arc<DaemonState>,
 ) -> Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(Duration::from_millis(TCP_TIMEOUT_MS)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(TCP_TIMEOUT_MS)))?;
 
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
@@ -209,10 +216,10 @@ fn run_mdns_broadcaster(state: Arc<DaemonState>, _cache_root: PathBuf) -> Result
 
     loop {
         let msg = format!("VOLT_PEER:{}:{}", local_ip, VOLT_PORT);
-        socket.send_to(
+        let _ = socket.send_to(
             msg.as_bytes(),
             format!("{}:{}", MULTICAST_ADDR, MULTICAST_PORT),
-        )?;
+        );
 
         state.prune_stale_peers();
 
@@ -250,12 +257,8 @@ fn run_query_listener(state: Arc<DaemonState>, cache_root: PathBuf) -> Result<()
                     let query_hash = &msg[6..];
                     let manifest_path = cache_root.join("manifests").join(query_hash);
                     if manifest_path.exists() {
-                        let local_ip = get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
                         let resp = format!("HIT:{}:{}", query_hash, local_ip);
-                        socket.send_to(
-                            resp.as_bytes(),
-                            (src.ip(), MULTICAST_PORT),
-                        )?;
+                        let _ = socket.send_to(resp.as_bytes(), (src.ip(), MULTICAST_PORT));
                     }
                 } else if msg.starts_with("HIT:") {
                     let hit_info = &msg[4..];
@@ -284,6 +287,7 @@ fn run_query_listener(state: Arc<DaemonState>, cache_root: PathBuf) -> Result<()
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => {}
         }
     }
@@ -300,8 +304,8 @@ fn fetch_from_peer(
 
     let mut stream = TcpStream::connect(&peer_addr)
         .context(format!("Failed to connect to peer {}", peer_addr))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_read_timeout(Some(Duration::from_millis(TCP_LONG_TIMEOUT_MS)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(TCP_TIMEOUT_MS)))?;
 
     stream.write_all(format!("FETCH_MANIFEST {}\n", hash).as_bytes())?;
 
@@ -324,7 +328,7 @@ fn fetch_from_peer(
         let objects_dir = cache_root.join("objects").join(hash);
         fs::create_dir_all(&objects_dir)?;
 
-        for (idx, _) in manifest.entries.iter().enumerate() {
+        for (idx, entry) in manifest.entries.iter().enumerate() {
             let artifact_name = format!("artifact_{}", idx);
             let artifact_path = objects_dir.join(&artifact_name);
             if artifact_path.exists() {
@@ -332,8 +336,8 @@ fn fetch_from_peer(
             }
 
             let mut obj_stream = TcpStream::connect(&peer_addr)?;
-            obj_stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-            obj_stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+            obj_stream.set_read_timeout(Some(Duration::from_millis(TCP_LONG_TIMEOUT_MS)))?;
+            obj_stream.set_write_timeout(Some(Duration::from_millis(TCP_TIMEOUT_MS)))?;
 
             obj_stream.write_all(
                 format!("FETCH_OBJECT {} {}\n", hash, artifact_name).as_bytes(),
@@ -347,9 +351,54 @@ fn fetch_from_peer(
                 let mut obj_len_bytes = [0u8; 4];
                 obj_stream.read_exact(&mut obj_len_bytes)?;
                 let obj_len = u32::from_le_bytes(obj_len_bytes) as usize;
-                let mut obj_data = vec![0u8; obj_len];
-                obj_stream.read_exact(&mut obj_data)?;
-                fs::write(&artifact_path, &obj_data)?;
+
+                let tmp_path = artifact_path.with_extension("tmp");
+                let mut hasher = Sha256::new();
+                let mut file = fs::File::create(&tmp_path)?;
+                let mut remaining = obj_len;
+                let mut buf = [0u8; 8192];
+
+                while remaining > 0 {
+                    let to_read = remaining.min(buf.len());
+                    match obj_stream.read(&mut buf[..to_read]) {
+                        Ok(0) => {
+                            let _ = fs::remove_file(&tmp_path);
+                            anyhow::bail!("Connection closed while reading object from peer");
+                        }
+                        Ok(n) => {
+                            file.write_all(&buf[..n])?;
+                            hasher.update(&buf[..n]);
+                            remaining -= n;
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                            let _ = fs::remove_file(&tmp_path);
+                            anyhow::bail!("Timeout reading object from peer");
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                            continue;
+                        }
+                        Err(e) => {
+                            let _ = fs::remove_file(&tmp_path);
+                            anyhow::bail!("Network error reading object: {}", e);
+                        }
+                    }
+                }
+
+                let downloaded_hash = hex::encode(hasher.finalize());
+                let expected_hash = &entry.object_hash;
+
+                if downloaded_hash != *expected_hash {
+                    let _ = fs::remove_file(&tmp_path);
+                    anyhow::bail!(
+                        "Integrity check failed: expected {}, got {}",
+                        &expected_hash[..16],
+                        &downloaded_hash[..16]
+                    );
+                }
+
+                fs::rename(&tmp_path, &artifact_path)?;
+            } else {
+                let _ = fs::remove_file(artifact_path.with_extension("tmp"));
             }
         }
 
@@ -361,19 +410,19 @@ fn fetch_from_peer(
 
 pub fn query_peer_cache(cache_root: &Path, hash: &str) -> Result<Option<String>> {
     let socket = UdpSocket::bind("0.0.0.0:0").context("Failed to bind query socket")?;
-    socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+    socket.set_read_timeout(Some(Duration::from_millis(P2P_QUERY_TIMEOUT_MS)))?;
     socket.set_multicast_loop_v4(true)?;
     let multicast: std::net::Ipv4Addr = MULTICAST_ADDR.parse()?;
     socket.join_multicast_v4(&multicast, &"0.0.0.0".parse()?)?;
 
     let query = format!("QUERY:{}", hash);
-    socket.send_to(
+    let _ = socket.send_to(
         query.as_bytes(),
         format!("{}:{}", MULTICAST_ADDR, MULTICAST_PORT),
-    )?;
+    );
 
     let mut buf = [0u8; 2048];
-    let deadline = Instant::now() + Duration::from_millis(100);
+    let deadline = Instant::now() + Duration::from_millis(P2P_QUERY_TIMEOUT_MS);
 
     loop {
         if Instant::now() >= deadline {
@@ -394,8 +443,21 @@ pub fn query_peer_cache(cache_root: &Path, hash: &str) -> Result<Option<String>>
                             let peer_addr = format!("{}:{}", hit_ip, hit_port);
                             println!("Volt P2P: Cache HIT from peer {}", peer_addr);
 
-                            fetch_manifest_from_peer(cache_root, hash, &peer_addr)?;
-                            fetch_objects_from_peer(cache_root, hash, &peer_addr)?;
+                            match fetch_manifest_from_peer(cache_root, hash, &peer_addr) {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    eprintln!("Volt P2P: Failed to fetch manifest: {}", e);
+                                    return Ok(None);
+                                }
+                            }
+
+                            match fetch_objects_from_peer(cache_root, hash, &peer_addr) {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    eprintln!("Volt P2P: Failed to fetch objects: {}", e);
+                                    return Ok(None);
+                                }
+                            }
 
                             return Ok(Some(peer_addr));
                         }
@@ -404,6 +466,9 @@ pub fn query_peer_cache(cache_root: &Path, hash: &str) -> Result<Option<String>>
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 break;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                continue;
             }
             Err(_) => {
                 break;
@@ -421,8 +486,8 @@ fn fetch_manifest_from_peer(
 ) -> Result<()> {
     let mut stream = TcpStream::connect(peer_addr)
         .context(format!("Failed to connect to peer {}", peer_addr))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_read_timeout(Some(Duration::from_millis(TCP_LONG_TIMEOUT_MS)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(TCP_TIMEOUT_MS)))?;
 
     stream.write_all(format!("FETCH_MANIFEST {}\n", hash).as_bytes())?;
 
@@ -461,32 +526,115 @@ fn fetch_objects_from_peer(
     let objects_dir = cache_root.join("objects").join(hash);
     fs::create_dir_all(&objects_dir)?;
 
-    for (idx, _entry) in manifest.entries.iter().enumerate() {
+    for (idx, entry) in manifest.entries.iter().enumerate() {
         let artifact_name = format!("artifact_{}", idx);
         let artifact_path = objects_dir.join(&artifact_name);
         if artifact_path.exists() {
             continue;
         }
 
-        let mut stream = TcpStream::connect(peer_addr)?;
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+        let mut stream = match TcpStream::connect(peer_addr) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Volt P2P: Connection to peer failed: {}", e);
+                continue;
+            }
+        };
+        stream.set_read_timeout(Some(Duration::from_millis(TCP_LONG_TIMEOUT_MS)))?;
+        stream.set_write_timeout(Some(Duration::from_millis(TCP_TIMEOUT_MS)))?;
 
-        stream.write_all(
+        if let Err(e) = stream.write_all(
             format!("FETCH_OBJECT {} {}\n", hash, artifact_name).as_bytes(),
-        )?;
+        ) {
+            eprintln!("Volt P2P: Failed to send request: {}", e);
+            continue;
+        }
 
         let mut obj_header = [0u8; 7];
-        stream.read_exact(&mut obj_header)?;
-        let obj_header_str = std::str::from_utf8(&obj_header)?;
+        if let Err(e) = stream.read_exact(&mut obj_header) {
+            eprintln!("Volt P2P: Failed to read object header: {}", e);
+            continue;
+        }
+        let obj_header_str = match std::str::from_utf8(&obj_header) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
 
-        if obj_header_str.starts_with("OBJECT ") {
-            let mut obj_len_bytes = [0u8; 4];
-            stream.read_exact(&mut obj_len_bytes)?;
-            let obj_len = u32::from_le_bytes(obj_len_bytes) as usize;
-            let mut obj_data = vec![0u8; obj_len];
-            stream.read_exact(&mut obj_data)?;
-            fs::write(&artifact_path, &obj_data)?;
+        if !obj_header_str.starts_with("OBJECT ") {
+            continue;
+        }
+
+        let mut obj_len_bytes = [0u8; 4];
+        if let Err(e) = stream.read_exact(&mut obj_len_bytes) {
+            eprintln!("Volt P2P: Failed to read object length: {}", e);
+            continue;
+        }
+        let obj_len = u32::from_le_bytes(obj_len_bytes) as usize;
+
+        let tmp_path = artifact_path.with_extension("tmp");
+        let mut hasher = Sha256::new();
+        let mut file = match fs::File::create(&tmp_path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Volt P2P: Failed to create temp file: {}", e);
+                continue;
+            }
+        };
+        let mut remaining = obj_len;
+        let mut buf = [0u8; 8192];
+        let mut integrity_ok = true;
+
+        while remaining > 0 {
+            let to_read = remaining.min(buf.len());
+            match stream.read(&mut buf[..to_read]) {
+                Ok(0) => {
+                    eprintln!("Volt P2P: Connection closed mid-transfer");
+                    integrity_ok = false;
+                    break;
+                }
+                Ok(n) => {
+                    if file.write_all(&buf[..n]).is_err() {
+                        integrity_ok = false;
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                    remaining -= n;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    eprintln!("Volt P2P: Timeout during transfer");
+                    integrity_ok = false;
+                    break;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("Volt P2P: Network error: {}", e);
+                    integrity_ok = false;
+                    break;
+                }
+            }
+        }
+
+        if !integrity_ok {
+            let _ = fs::remove_file(&tmp_path);
+            continue;
+        }
+
+        let downloaded_hash = hex::encode(hasher.finalize());
+        if downloaded_hash != entry.object_hash {
+            eprintln!(
+                "Volt P2P: Integrity mismatch for {}: expected {}.., got {}..",
+                artifact_name,
+                &entry.object_hash[..16],
+                &downloaded_hash[..16]
+            );
+            let _ = fs::remove_file(&tmp_path);
+            continue;
+        }
+
+        if fs::rename(&tmp_path, &artifact_path).is_err() {
+            let _ = fs::remove_file(&tmp_path);
         }
     }
 

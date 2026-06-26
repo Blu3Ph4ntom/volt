@@ -1,4 +1,6 @@
 mod daemon;
+mod gc;
+mod state;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -26,6 +28,7 @@ enum Commands {
         cmd: Vec<String>,
     },
     Daemon,
+    Gc,
     Benchmark {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
@@ -123,47 +126,12 @@ impl Volt {
         Ok((meta.len(), meta.mtime(), meta.mtime_nsec()))
     }
 
-    fn compute_content_hash(path: &Path) -> Result<String> {
-        let mut hasher = Sha256::new();
-        let content = fs::read(path)?;
-        hasher.update(&content);
-        Ok(hex::encode(hasher.finalize()))
-    }
-
     fn compute_input_hash(&self, cmd: &[String], files: &HashSet<String>) -> Result<String> {
-        let mut hasher = Sha256::new();
-
+        let state_db = state::StateDb::open(&self.root)?;
         let env_fp = Self::env_fingerprint(cmd);
-        hasher.update(env_fp.as_bytes());
-
-        let compiler_path = which(cmd.first().map(|s| s.as_str()).unwrap_or("cc"));
-        if let Some(ref cp) = compiler_path {
-            hasher.update(b"compiler:");
-            hasher.update(cp.as_bytes());
-            if let Ok(meta) = fs::metadata(cp) {
-                hasher.update(&meta.len().to_le_bytes());
-                hasher.update(&meta.mtime().to_le_bytes());
-            }
-        }
-
-        let mut sorted_files: Vec<_> = files.iter().collect();
-        sorted_files.sort();
-        for file in sorted_files {
-            let path = Path::new(file);
-            if path.exists() && path.is_file() {
-                if let Ok((size, mtime, mtime_nsec)) = Self::compute_metadata_fast(path) {
-                    hasher.update(file.as_bytes());
-                    hasher.update(&size.to_le_bytes());
-                    hasher.update(&mtime.to_le_bytes());
-                    hasher.update(&mtime_nsec.to_le_bytes());
-                    if let Ok(content_hash) = Self::compute_content_hash(path) {
-                        hasher.update(content_hash.as_bytes());
-                    }
-                }
-            }
-        }
-
-        Ok(hex::encode(hasher.finalize()))
+        let hash = state_db.compute_input_hash_fast(cmd, files, &env_fp)?;
+        let _ = state_db.save();
+        Ok(hash)
     }
 
     fn is_ephemeral_input(path: &str) -> bool {
@@ -402,17 +370,25 @@ impl Volt {
             return Ok(());
         }
 
-        if let Ok(Some(peer_addr)) = daemon::query_peer_cache(&self.root, &hash) {
-            println!("Volt: P2P Cache HIT from peer {}", peer_addr);
-            if let Some(manifest) = self.lookup_cache(&hash)? {
-                let restored = self.restore_manifest(&manifest)?;
-                println!("Volt: Restored {} artifacts from peer", restored);
-                return Ok(());
+        match daemon::query_peer_cache(&self.root, &hash) {
+            Ok(Some(peer_addr)) => {
+                println!("Volt: P2P Cache HIT from peer {}", peer_addr);
+                if let Some(manifest) = self.lookup_cache(&hash)? {
+                    let restored = self.restore_manifest(&manifest)?;
+                    println!("Volt: Restored {} artifacts from peer", restored);
+                    return Ok(());
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("Volt: P2P query failed (falling back to local build): {}", e);
             }
         }
 
         println!("Volt: Storing {} outputs", outputs.len());
         self.store_outputs(&hash, &outputs, &inputs, &cmd)?;
+
+        let _ = gc::run_gc(&self.root);
 
         Ok(())
     }
@@ -544,14 +520,6 @@ impl Volt {
     }
 }
 
-fn which(name: &str) -> Option<String> {
-    if let Ok(path) = which::which(name) {
-        Some(path.to_string_lossy().to_string())
-    } else {
-        None
-    }
-}
-
 fn try_ficlone(src: &Path, dst: &Path) -> Result<()> {
     use std::os::unix::io::AsRawFd;
     let src_file = fs::File::open(src)?;
@@ -578,6 +546,14 @@ fn main() -> Result<()> {
         Commands::Init => volt.ensure_dirs()?,
         Commands::Run { cmd } => volt.run(cmd)?,
         Commands::Daemon => daemon::run_daemon(volt.root)?,
+        Commands::Gc => {
+            let _freed = gc::run_gc(&volt.root)?;
+            let size = gc::get_cache_size(&volt.root)?;
+            println!(
+                "Cache size: {:.1} MB",
+                size as f64 / (1024.0 * 1024.0)
+            );
+        }
         Commands::Benchmark { cmd } => volt.benchmark(cmd)?,
     }
 
